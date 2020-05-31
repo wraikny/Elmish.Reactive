@@ -11,13 +11,14 @@ type RxProgram<'arg, 'model, 'msg, 'view>(program: Program<'arg, 'model, 'msg, '
   do
     if isNull ctx then invalidOp "Call from UI thread"
 
+  let mutable queue = Queue<'msg>()
   let onErrorEvent = Event<string * exn>()
   let viewEvent = Event<'view>()
 
   let mutable lastModel = Unchecked.defaultof<_>
-  let mutable dispatch = Unchecked.defaultof<_>
+  let mutable dispatch = None
 
-  do
+  let program =
     let view = Program.view program
 
     program
@@ -29,14 +30,16 @@ type RxProgram<'arg, 'model, 'msg, 'view>(program: Program<'arg, 'model, 'msg, '
     )
     |> Program.withSubscription (fun _ ->
       [ fun f ->
-        dispatch <- f
+        dispatch <- Some f
+
+        while queue.Count > 0 do
+          f(queue.Dequeue())
       ]
     )
     |> Program.mapErrorHandler(fun handler x ->
       handler x
       onErrorEvent.Trigger(x)
     )
-    |> Program.runWith arg
 
   member private __.View with get() = viewEvent.Publish
   member __.OnError with get() = onErrorEvent.Publish
@@ -44,10 +47,20 @@ type RxProgram<'arg, 'model, 'msg, 'view>(program: Program<'arg, 'model, 'msg, '
   member __.LastModel with get() = lastModel
 
   member __.Dispatch(msg) =
+    let inline exec() =
+      dispatch |> function
+      | Some f -> f msg
+      | _ -> queue.Enqueue(msg)
+
     if isNull SynchronizationContext.Current then
-      ctx.Post((fun _ -> dispatch msg), null)
+      ctx.Post((fun _ -> exec()), null)
     else
-      dispatch msg
+      exec()
+
+  member __.Run arg =
+    program
+    |> Program.runWith arg
+    queue <- null
 
   interface IObservable<'view> with
     member this.Subscribe(observer) =
@@ -56,13 +69,13 @@ type RxProgram<'arg, 'model, 'msg, 'view>(program: Program<'arg, 'model, 'msg, '
 
 [<RequireQualifiedAccess>]
 module RxProgram =
-  let inline start arg program: RxProgram<'arg, 'model, 'msg, 'view> =
+  let inline make arg program: RxProgram<'arg, 'model, 'msg, 'view> =
     new RxProgram<_, _, _, _>(program, arg)
 
-  let inline startProgram (initModel: 'model * Cmd<'msg>) update =
+  let inline mkProgram (initModel: 'model * Cmd<'msg>) update =
     Program.mkProgram (fun() -> initModel) update (fun m _ -> m)
-    |> start ()
+    |> make ()
 
-  let inline startSimple (initModel: 'model) update =
+  let inline mkSimple (initModel: 'model) update =
     Program.mkSimple (fun () -> initModel) update (fun m _ -> m)
-    |> start ()
+    |> make ()
